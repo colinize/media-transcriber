@@ -7,16 +7,302 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
+from typing import Any
 
+import yaml
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 
 console = Console()
+
+
+# ============================================================================
+# CONFIG FILE SUPPORT
+# ============================================================================
+
+CONFIG_PATHS = [
+    Path.home() / ".config" / "transcriber" / "config.yaml",
+    Path("./transcriber.yaml"),
+]
+
+DEFAULT_CONFIG = {
+    "defaults": {
+        "model": "large-v3",
+        "backend": "faster-whisper",
+        "vocabulary": "pinball",  # "pinball", "none", or path to custom file
+    },
+    "output": {
+        "formats": ["transcript"],  # transcript, srt, vtt
+        "frontmatter": False,
+    },
+    "llm": {
+        "provider": "auto",  # ollama, openai, auto
+        "model": None,  # None means use provider default
+    },
+    "diarization": {
+        "enabled": False,
+        "hf_token": "${HF_TOKEN}",  # env var expansion
+    },
+}
+
+
+def expand_env_vars(value: Any) -> Any:
+    """Recursively expand ${VAR} environment variables in config values."""
+    if isinstance(value, str):
+        # Match ${VAR} pattern
+        pattern = re.compile(r'\$\{([^}]+)\}')
+        def replacer(match):
+            var_name = match.group(1)
+            return os.environ.get(var_name, "")
+        return pattern.sub(replacer, value)
+    elif isinstance(value, dict):
+        return {k: expand_env_vars(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [expand_env_vars(v) for v in value]
+    return value
+
+
+def load_config(config_path: Path | None = None) -> dict:
+    """Load configuration from file.
+
+    Args:
+        config_path: Explicit path to config file, or None to search default locations
+
+    Returns:
+        Configuration dictionary with defaults filled in
+    """
+    config = {}
+
+    # Determine which config file to load
+    if config_path:
+        paths_to_try = [config_path]
+    else:
+        paths_to_try = CONFIG_PATHS
+
+    # Try each path
+    for path in paths_to_try:
+        if path.exists():
+            try:
+                with open(path) as f:
+                    config = yaml.safe_load(f) or {}
+                console.print(f"[dim]Loaded config from: {path}[/dim]")
+                break
+            except yaml.YAMLError as e:
+                console.print(f"[yellow]Warning:[/yellow] Invalid YAML in {path}: {e}")
+
+    # Expand environment variables
+    config = expand_env_vars(config)
+
+    # Merge with defaults
+    merged = dict(DEFAULT_CONFIG)
+    for section, values in config.items():
+        if section in merged and isinstance(values, dict):
+            merged[section].update(values)
+        else:
+            merged[section] = values
+
+    return merged
+
+
+def save_config(args: argparse.Namespace, config_path: Path | None = None) -> Path:
+    """Save current CLI args as a config file.
+
+    Args:
+        args: Parsed command-line arguments
+        config_path: Path to save config to (defaults to ~/.config/transcriber/config.yaml)
+
+    Returns:
+        Path where config was saved
+    """
+    if config_path is None:
+        config_path = CONFIG_PATHS[0]
+
+    # Create config directory if needed
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build config from current args
+    config = {
+        "defaults": {
+            "model": args.model,
+            "backend": args.backend,
+        },
+        "output": {
+            "formats": [],
+            "frontmatter": getattr(args, 'frontmatter', False),
+        },
+        "llm": {
+            "provider": args.summarize_provider,
+            "model": args.summarize_model,
+        },
+        "diarization": {
+            "enabled": args.diarize,
+            "hf_token": "${HF_TOKEN}",  # Always use env var reference
+        },
+    }
+
+    # Set vocabulary
+    if args.no_vocab:
+        config["defaults"]["vocabulary"] = "none"
+    elif args.vocab:
+        config["defaults"]["vocabulary"] = str(args.vocab)
+    else:
+        config["defaults"]["vocabulary"] = "pinball"
+
+    # Set output formats
+    config["output"]["formats"].append("transcript")
+    if args.srt:
+        config["output"]["formats"].append("srt")
+    if args.vtt:
+        config["output"]["formats"].append("vtt")
+
+    # Write config
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    return config_path
+
+
+def apply_config_to_args(config: dict, args: argparse.Namespace) -> argparse.Namespace:
+    """Apply config values to args where args are still at defaults.
+
+    CLI arguments take precedence over config file values.
+    Only applies config values when the CLI arg wasn't explicitly set.
+
+    Args:
+        config: Configuration dictionary
+        args: Parsed CLI arguments
+
+    Returns:
+        Modified args namespace
+    """
+    defaults = config.get("defaults", {})
+    output = config.get("output", {})
+    llm = config.get("llm", {})
+    diarization = config.get("diarization", {})
+
+    # Model and backend (only if using default values)
+    if args.model == "large-v3":  # default value
+        args.model = defaults.get("model", args.model)
+    if args.backend == "faster-whisper":  # default value
+        args.backend = defaults.get("backend", args.backend)
+
+    # Vocabulary
+    vocab = defaults.get("vocabulary", "pinball")
+    if vocab == "none":
+        if not args.vocab:  # Don't override explicit --vocab
+            args.no_vocab = True
+    elif vocab == "pinball":
+        pass  # Default behavior
+    elif vocab and not args.no_vocab and not args.vocab:
+        # Custom vocab file path
+        args.vocab = Path(vocab)
+
+    # Output formats
+    formats = output.get("formats", [])
+    if "srt" in formats and not args.srt:
+        args.srt = True
+    if "vtt" in formats and not args.vtt:
+        args.vtt = True
+
+    # Frontmatter
+    if output.get("frontmatter", False):
+        args.frontmatter = True
+
+    # LLM settings
+    if args.summarize_provider == "auto":  # default value
+        args.summarize_provider = llm.get("provider", args.summarize_provider)
+    if args.summarize_model is None:
+        args.summarize_model = llm.get("model")
+
+    # Diarization
+    if diarization.get("enabled", False) and not args.diarize:
+        args.diarize = True
+
+    return args
+
+
+# ============================================================================
+# MLX WHISPER SUPPORT
+# ============================================================================
+
+# MLX Whisper wrapper to provide compatible interface with faster-whisper
+class MlxSegment:
+    """Wrapper to give mlx-whisper segments the same attribute interface as faster-whisper."""
+    def __init__(self, segment_dict):
+        self.start = segment_dict.get("start", 0)
+        self.end = segment_dict.get("end", 0)
+        self.text = segment_dict.get("text", "")
+        self.words = segment_dict.get("words", [])
+
+
+class MlxTranscriptionInfo:
+    """Wrapper to provide transcription info like faster-whisper."""
+    def __init__(self, result, audio_duration=None):
+        self.language = result.get("language", "en")
+        self.language_probability = 1.0
+        # Try to get duration from last segment if not provided
+        if audio_duration:
+            self.duration = audio_duration
+        elif result.get("segments"):
+            self.duration = result["segments"][-1].get("end", 0)
+        else:
+            self.duration = 0
+
+
+class MlxWhisperModel:
+    """Wrapper class to make mlx-whisper compatible with faster-whisper API."""
+
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        # Map model names to mlx-community HuggingFace repos
+        self.model_map = {
+            "tiny": "mlx-community/whisper-tiny-mlx",
+            "base": "mlx-community/whisper-base-mlx",
+            "small": "mlx-community/whisper-small-mlx",
+            "medium": "mlx-community/whisper-medium-mlx",
+            "large-v2": "mlx-community/whisper-large-v2-mlx",
+            "large-v3": "mlx-community/whisper-large-v3-mlx",
+            "distil-large-v3": "mlx-community/distil-whisper-large-v3",
+        }
+        self.model_repo = self.model_map.get(model_name, f"mlx-community/whisper-{model_name}-mlx")
+        # Import mlx_whisper here to avoid loading it unless needed
+        import mlx_whisper
+        self._mlx_whisper = mlx_whisper
+
+    def transcribe(self, audio_path: str, **kwargs) -> tuple:
+        """Transcribe audio file, returning (segments_generator, info) like faster-whisper."""
+        # Map faster-whisper options to mlx-whisper options
+        mlx_options = {
+            "path_or_hf_repo": self.model_repo,
+            "verbose": False,
+            "word_timestamps": kwargs.get("word_timestamps", False),
+        }
+
+        # Handle language
+        if "language" in kwargs and kwargs["language"]:
+            mlx_options["language"] = kwargs["language"]
+
+        # Handle initial_prompt (vocabulary)
+        if "initial_prompt" in kwargs and kwargs["initial_prompt"]:
+            mlx_options["initial_prompt"] = kwargs["initial_prompt"]
+
+        # Run transcription
+        result = self._mlx_whisper.transcribe(audio_path, **mlx_options)
+
+        # Convert segments to MlxSegment objects
+        segments = [MlxSegment(seg) for seg in result.get("segments", [])]
+
+        # Create info object
+        info = MlxTranscriptionInfo(result)
+
+        # Return as generator and info (matching faster-whisper interface)
+        return iter(segments), info
 
 # Summary generation settings
 SUMMARY_SYSTEM_PROMPT = """You are a podcast/media summarizer. Create a concise, well-structured summary of the transcript provided.
@@ -964,6 +1250,9 @@ def process_single_file(
     file_index: int,
     total_files: int,
     show_folder: bool,
+    frontmatter_flag: bool = False,
+    speaker_map: dict[str, str] | None = None,
+    interactive_speakers: bool = False,
 ) -> dict:
     """Process a single media file. Thread-safe worker function.
 
@@ -994,7 +1283,10 @@ def process_single_file(
     try:
         # Transcribe
         markdown, segments, duration, has_speakers = transcribe_file(
-            media_file, model, model_name, language, vocabulary, diarize
+            media_file, model, model_name, language, vocabulary, diarize,
+            frontmatter=frontmatter_flag,
+            speaker_map=speaker_map,
+            interactive_speakers=interactive_speakers,
         )
 
         # Save markdown transcript
@@ -1107,20 +1399,620 @@ def process_single_file(
         return result
 
 
-def generate_markdown(filename: str, segments: list, duration: float, model_name: str, has_speakers: bool = False) -> str:
-    """Generate formatted markdown transcript from segments."""
-    lines = [
+# ============================================================================
+# YAML FRONTMATTER SUPPORT
+# ============================================================================
+
+def generate_frontmatter(
+    filename: str,
+    source_path: Path,
+    duration: float,
+    model_name: str,
+    language: str,
+    speaker_count: int,
+    word_count: int,
+    topics: list[str] | None = None,
+    entities: dict | None = None,
+) -> str:
+    """Generate YAML frontmatter for Obsidian/Logseq integration.
+
+    Args:
+        filename: Original media filename
+        source_path: Path to source media file
+        duration: Duration in seconds
+        model_name: Whisper model used
+        language: Detected/specified language
+        speaker_count: Number of speakers detected
+        word_count: Total word count
+        topics: Optional list of topics (from LLM analysis)
+        entities: Optional dict of entities (from LLM analysis)
+
+    Returns:
+        YAML frontmatter string including --- delimiters
+    """
+    frontmatter = {
+        "title": Path(filename).stem,
+        "source": str(source_path),
+        "duration": format_duration(duration),
+        "transcribed": datetime.now().isoformat(timespec='seconds'),
+        "model": f"whisper-{model_name}",
+        "language": language or "auto",
+        "speakers": speaker_count,
+        "word_count": word_count,
+    }
+
+    # Add optional analysis metadata
+    if topics:
+        frontmatter["topics"] = topics
+    if entities:
+        # Filter to non-empty entity categories
+        filtered = {k: v for k, v in entities.items() if v}
+        if filtered:
+            frontmatter["entities"] = filtered
+
+    # Generate YAML
+    yaml_str = yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    return f"---\n{yaml_str}---\n\n"
+
+
+def parse_frontmatter(content: str) -> tuple[dict, str]:
+    """Parse YAML frontmatter from transcript content.
+
+    Args:
+        content: Full transcript content
+
+    Returns:
+        Tuple of (frontmatter_dict, remaining_content)
+    """
+    if not content.startswith("---"):
+        return {}, content
+
+    # Find closing ---
+    end_match = re.search(r'\n---\n', content[3:])
+    if not end_match:
+        return {}, content
+
+    yaml_content = content[4:end_match.start() + 3]
+    remaining = content[end_match.end() + 4:]
+
+    try:
+        frontmatter = yaml.safe_load(yaml_content) or {}
+    except yaml.YAMLError:
+        frontmatter = {}
+
+    return frontmatter, remaining
+
+
+# ============================================================================
+# SPEAKER NAMING SUPPORT
+# ============================================================================
+
+def load_speaker_map(folder: Path) -> dict[str, str]:
+    """Load speaker name mapping from a .speakers.yaml file.
+
+    Args:
+        folder: Directory to search for .speakers.yaml
+
+    Returns:
+        Dict mapping speaker IDs to names (e.g., {"SPEAKER_00": "Colin"})
+    """
+    speaker_file = folder / ".speakers.yaml"
+    if not speaker_file.exists():
+        return {}
+
+    try:
+        with open(speaker_file) as f:
+            data = yaml.safe_load(f) or {}
+        # Support both direct mapping and nested "default_speakers" format
+        if "default_speakers" in data:
+            return {f"SPEAKER_{int(k):02d}": v for k, v in data["default_speakers"].items()}
+        return {f"SPEAKER_{int(k):02d}": v for k, v in data.items() if isinstance(k, (int, str))}
+    except (yaml.YAMLError, ValueError):
+        return {}
+
+
+def parse_speakers_arg(speakers_str: str) -> dict[str, str]:
+    """Parse --speakers CLI argument.
+
+    Args:
+        speakers_str: Format "1=Name,2=Name2" or "0=Host,1=Guest"
+
+    Returns:
+        Dict mapping speaker IDs to names
+    """
+    mapping = {}
+    if not speakers_str:
+        return mapping
+
+    for pair in speakers_str.split(","):
+        if "=" in pair:
+            num, name = pair.split("=", 1)
+            num = num.strip()
+            name = name.strip()
+            if num.isdigit():
+                # Convert 1-based or 0-based to SPEAKER_00 format
+                speaker_id = f"SPEAKER_{int(num):02d}"
+                mapping[speaker_id] = name
+
+    return mapping
+
+
+def prompt_for_speaker_names(speaker_ids: set[str]) -> dict[str, str]:
+    """Interactively prompt user for speaker names.
+
+    Args:
+        speaker_ids: Set of detected speaker IDs
+
+    Returns:
+        Dict mapping speaker IDs to user-provided names
+    """
+    sorted_ids = sorted(speaker_ids)
+    console.print(f"\nDetected {len(sorted_ids)} speaker(s). Enter names (or press Enter to skip):")
+
+    mapping = {}
+    for speaker_id in sorted_ids:
+        # Extract number for display (SPEAKER_00 -> 1)
+        num = int(speaker_id.split("_")[1]) + 1
+        name = console.input(f"  Speaker {num}: ").strip()
+        if name:
+            mapping[speaker_id] = name
+
+    return mapping
+
+
+def apply_speaker_names(segments: list, speaker_map: dict[str, str]) -> list:
+    """Apply speaker name mapping to segments.
+
+    Args:
+        segments: List of segment dicts with "speaker" key
+        speaker_map: Dict mapping speaker IDs to names
+
+    Returns:
+        Modified segments with renamed speakers
+    """
+    if not speaker_map:
+        return segments
+
+    for segment in segments:
+        if "speaker" in segment:
+            original = segment["speaker"]
+            if original in speaker_map:
+                segment["speaker"] = speaker_map[original]
+
+    return segments
+
+
+def save_speaker_map(folder: Path, speaker_map: dict[str, str]) -> None:
+    """Save speaker mapping for future use.
+
+    Args:
+        folder: Directory to save .speakers.yaml
+        speaker_map: Dict mapping speaker IDs to names
+    """
+    if not speaker_map:
+        return
+
+    speaker_file = folder / ".speakers.yaml"
+
+    # Convert SPEAKER_00 format to simpler numbered format
+    simple_map = {}
+    for speaker_id, name in speaker_map.items():
+        if speaker_id.startswith("SPEAKER_"):
+            num = int(speaker_id.split("_")[1])
+            simple_map[num] = name
+        else:
+            simple_map[speaker_id] = name
+
+    data = {"default_speakers": simple_map}
+
+    with open(speaker_file, 'w') as f:
+        yaml.dump(data, f, default_flow_style=False)
+
+    console.print(f"  [dim]Saved speaker map to: {speaker_file.name}[/dim]")
+
+
+# ============================================================================
+# SEMANTIC SEARCH SUPPORT
+# ============================================================================
+
+SEARCH_DB_PATH = Path.home() / ".transcriber_index.db"
+
+
+def init_search_db(db_path: Path = SEARCH_DB_PATH) -> sqlite3.Connection:
+    """Initialize the search database with required tables.
+
+    Args:
+        db_path: Path to SQLite database
+
+    Returns:
+        Database connection
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transcripts (
+            id INTEGER PRIMARY KEY,
+            path TEXT UNIQUE,
+            title TEXT,
+            duration INTEGER,
+            word_count INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chunks (
+            id INTEGER PRIMARY KEY,
+            transcript_id INTEGER,
+            text TEXT,
+            start_time REAL,
+            end_time REAL,
+            embedding BLOB,
+            FOREIGN KEY (transcript_id) REFERENCES transcripts(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_transcript ON chunks(transcript_id)")
+    conn.commit()
+    return conn
+
+
+def chunk_transcript(content: str, chunk_size: int = 500, overlap: int = 50) -> list[dict]:
+    """Split transcript into overlapping chunks for embedding.
+
+    Args:
+        content: Full transcript text
+        chunk_size: Target words per chunk
+        overlap: Words to overlap between chunks
+
+    Returns:
+        List of chunk dicts with text, start_time, end_time
+    """
+    # Parse out timestamp lines
+    lines = content.split('\n')
+    chunks = []
+    current_chunk = []
+    current_words = 0
+    chunk_start_time = 0.0
+    last_time = 0.0
+
+    timestamp_pattern = re.compile(r'^\[(\d+):(\d+):?(\d+)?\]')
+
+    for line in lines:
+        # Skip metadata lines
+        if line.startswith('#') or line.startswith('**') or line.startswith('---'):
+            continue
+
+        # Extract timestamp if present
+        match = timestamp_pattern.match(line)
+        if match:
+            groups = match.groups()
+            if groups[2]:  # HH:MM:SS format
+                last_time = int(groups[0]) * 3600 + int(groups[1]) * 60 + int(groups[2])
+            else:  # MM:SS format
+                last_time = int(groups[0]) * 60 + int(groups[1])
+
+            if not current_chunk:
+                chunk_start_time = last_time
+
+            # Remove timestamp from line
+            line = line[match.end():].strip()
+
+        if not line:
+            continue
+
+        words = line.split()
+        current_chunk.extend(words)
+        current_words += len(words)
+
+        # Create chunk when we hit the size limit
+        if current_words >= chunk_size:
+            chunks.append({
+                "text": " ".join(current_chunk),
+                "start_time": chunk_start_time,
+                "end_time": last_time,
+            })
+            # Keep overlap for next chunk
+            current_chunk = current_chunk[-overlap:] if overlap else []
+            current_words = len(current_chunk)
+            chunk_start_time = last_time
+
+    # Add final chunk
+    if current_chunk:
+        chunks.append({
+            "text": " ".join(current_chunk),
+            "start_time": chunk_start_time,
+            "end_time": last_time,
+        })
+
+    return chunks
+
+
+def get_embeddings(texts: list[str], model_name: str = "all-MiniLM-L6-v2") -> list:
+    """Generate embeddings for a list of texts.
+
+    Args:
+        texts: List of text strings to embed
+        model_name: Sentence transformer model name
+
+    Returns:
+        List of embedding arrays
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        console.print("[red]Error:[/red] sentence-transformers not installed")
+        console.print("Install with: pip install sentence-transformers")
+        sys.exit(1)
+
+    model = SentenceTransformer(model_name)
+    embeddings = model.encode(texts, show_progress_bar=True)
+    return embeddings
+
+
+def index_transcripts(folders: list[Path], db_path: Path = SEARCH_DB_PATH) -> int:
+    """Index all transcripts in folders for semantic search.
+
+    Args:
+        folders: List of folders containing transcripts
+        db_path: Path to search database
+
+    Returns:
+        Number of transcripts indexed
+    """
+    import numpy as np
+
+    conn = init_search_db(db_path)
+    indexed = 0
+
+    # Collect all transcripts
+    all_transcripts = []
+    for folder in folders:
+        all_transcripts.extend(find_transcripts(folder))
+
+    if not all_transcripts:
+        console.print("[yellow]No transcripts found to index.[/yellow]")
+        return 0
+
+    console.print(f"Found {len(all_transcripts)} transcript(s) to index")
+
+    for transcript_path in all_transcripts:
+        # Check if already indexed and not modified
+        cursor = conn.execute(
+            "SELECT id, indexed_at FROM transcripts WHERE path = ?",
+            (str(transcript_path),)
+        )
+        row = cursor.fetchone()
+
+        file_mtime = datetime.fromtimestamp(transcript_path.stat().st_mtime)
+
+        if row:
+            indexed_at = datetime.fromisoformat(row[1])
+            if indexed_at > file_mtime:
+                console.print(f"  [dim]Skipped (unchanged): {transcript_path.name}[/dim]")
+                continue
+            # Delete old chunks for re-indexing
+            conn.execute("DELETE FROM chunks WHERE transcript_id = ?", (row[0],))
+            transcript_id = row[0]
+        else:
+            transcript_id = None
+
+        console.print(f"  Indexing: {transcript_path.name}")
+
+        # Read and parse transcript
+        content = transcript_path.read_text()
+        frontmatter, text_content = parse_frontmatter(content)
+
+        # Get metadata
+        title = frontmatter.get("title", transcript_path.stem.replace('.transcript', ''))
+        duration = frontmatter.get("duration", "0:00")
+        word_count = len(text_content.split())
+
+        # Parse duration to seconds
+        duration_parts = duration.split(":")
+        if len(duration_parts) == 3:
+            duration_secs = int(duration_parts[0]) * 3600 + int(duration_parts[1]) * 60 + int(duration_parts[2])
+        elif len(duration_parts) == 2:
+            duration_secs = int(duration_parts[0]) * 60 + int(duration_parts[1])
+        else:
+            duration_secs = 0
+
+        # Insert or update transcript record
+        if transcript_id:
+            conn.execute("""
+                UPDATE transcripts SET title = ?, duration = ?, word_count = ?, indexed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (title, duration_secs, word_count, transcript_id))
+        else:
+            cursor = conn.execute("""
+                INSERT INTO transcripts (path, title, duration, word_count)
+                VALUES (?, ?, ?, ?)
+            """, (str(transcript_path), title, duration_secs, word_count))
+            transcript_id = cursor.lastrowid
+
+        # Chunk the transcript
+        chunks = chunk_transcript(text_content)
+
+        if chunks:
+            # Generate embeddings for all chunks
+            chunk_texts = [c["text"] for c in chunks]
+            embeddings = get_embeddings(chunk_texts)
+
+            # Insert chunks with embeddings
+            for chunk, embedding in zip(chunks, embeddings):
+                embedding_blob = np.array(embedding).tobytes()
+                conn.execute("""
+                    INSERT INTO chunks (transcript_id, text, start_time, end_time, embedding)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (transcript_id, chunk["text"], chunk["start_time"], chunk["end_time"], embedding_blob))
+
+        conn.commit()
+        indexed += 1
+
+    conn.close()
+    return indexed
+
+
+def semantic_search(query: str, limit: int = 5, db_path: Path = SEARCH_DB_PATH) -> list[dict]:
+    """Search transcripts using semantic similarity.
+
+    Args:
+        query: Natural language search query
+        limit: Maximum number of results
+        db_path: Path to search database
+
+    Returns:
+        List of result dicts with transcript info and matching chunks
+    """
+    import numpy as np
+
+    if not db_path.exists():
+        console.print("[yellow]No search index found.[/yellow]")
+        console.print("Build index first: transcriber --index /path/to/transcripts")
+        return []
+
+    conn = init_search_db(db_path)
+
+    # Generate query embedding
+    query_embedding = get_embeddings([query])[0]
+    query_norm = np.linalg.norm(query_embedding)
+
+    # Get all chunks with their embeddings
+    cursor = conn.execute("""
+        SELECT c.id, c.text, c.start_time, c.end_time, c.embedding,
+               t.path, t.title, t.duration
+        FROM chunks c
+        JOIN transcripts t ON c.transcript_id = t.id
+    """)
+
+    results = []
+    for row in cursor:
+        chunk_id, text, start_time, end_time, embedding_blob, path, title, duration = row
+
+        # Deserialize embedding
+        embedding = np.frombuffer(embedding_blob, dtype=np.float32)
+
+        # Calculate cosine similarity
+        similarity = np.dot(query_embedding, embedding) / (query_norm * np.linalg.norm(embedding))
+
+        results.append({
+            "chunk_id": chunk_id,
+            "text": text,
+            "start_time": start_time,
+            "end_time": end_time,
+            "path": path,
+            "title": title,
+            "duration": duration,
+            "score": float(similarity),
+        })
+
+    conn.close()
+
+    # Sort by similarity score and return top results
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:limit]
+
+
+def display_search_results(results: list[dict], query: str) -> None:
+    """Display search results in a formatted way.
+
+    Args:
+        results: List of search result dicts
+        query: Original search query
+    """
+    if not results:
+        console.print(f"No matches found for: \"{query}\"")
+        return
+
+    console.print(f"\nFound {len(results)} matches for \"{query}\":\n")
+
+    for i, result in enumerate(results, 1):
+        # Format timestamp
+        start = result["start_time"]
+        timestamp = f"{int(start // 60):02d}:{int(start % 60):02d}"
+
+        # Truncate text for display
+        text = result["text"]
+        if len(text) > 200:
+            text = text[:200] + "..."
+
+        score = result["score"]
+
+        console.print(f"[bold]{i}. {result['title']}[/bold] [{timestamp}] [dim](score: {score:.2f})[/dim]")
+        console.print(f"   [dim]{result['path']}[/dim]")
+        console.print(f"   \"{text}\"")
+        console.print()
+
+
+# ============================================================================
+# TRANSCRIPT GENERATION
+# ============================================================================
+
+def generate_markdown(
+    filename: str,
+    segments: list,
+    duration: float,
+    model_name: str,
+    has_speakers: bool = False,
+    frontmatter: bool = False,
+    source_path: Path | None = None,
+    language: str | None = None,
+    topics: list[str] | None = None,
+    entities: dict | None = None,
+) -> str:
+    """Generate formatted markdown transcript from segments.
+
+    Args:
+        filename: Name of source media file
+        segments: List of transcript segments
+        duration: Duration in seconds
+        model_name: Whisper model name
+        has_speakers: Whether segments have speaker labels
+        frontmatter: Whether to include YAML frontmatter
+        source_path: Path to source file (for frontmatter)
+        language: Language code (for frontmatter)
+        topics: Optional topics list (for frontmatter)
+        entities: Optional entities dict (for frontmatter)
+
+    Returns:
+        Formatted markdown string
+    """
+    # Count words and speakers
+    total_words = sum(
+        len((seg.text if hasattr(seg, 'text') else seg.get("text", "")).split())
+        for seg in segments
+    )
+    speaker_count = 0
+    if has_speakers:
+        speakers = set(seg.get("speaker", "Unknown") for seg in segments if isinstance(seg, dict))
+        speaker_count = len(speakers)
+
+    lines = []
+
+    # Add YAML frontmatter if requested
+    if frontmatter and source_path:
+        fm = generate_frontmatter(
+            filename=filename,
+            source_path=source_path,
+            duration=duration,
+            model_name=model_name,
+            language=language or "auto",
+            speaker_count=speaker_count,
+            word_count=total_words,
+            topics=topics,
+            entities=entities,
+        )
+        lines.append(fm)
+
+    # Traditional header
+    lines.extend([
         f"# Transcript: {filename}",
         "",
         f"**Transcribed**: {datetime.now().strftime('%Y-%m-%d %H:%M')}  ",
         f"**Model**: whisper-{model_name}  ",
         f"**Duration**: {format_duration(duration)}",
-    ]
+    ])
 
     if has_speakers:
-        # Count unique speakers
-        speakers = set(seg.get("speaker", "Unknown") for seg in segments)
-        lines.append(f"**Speakers**: {len(speakers)}")
+        lines.append(f"**Speakers**: {speaker_count}")
 
     lines.extend(["", "---", ""])
 
@@ -1153,8 +2045,33 @@ def generate_markdown(filename: str, segments: list, duration: float, model_name
     return "\n".join(lines)
 
 
-def transcribe_file(file_path: Path, model, model_name: str, language: str | None, vocabulary: str | None, diarize: bool = False) -> tuple[str, list, float, bool]:
-    """Transcribe a single file and return (markdown, segments, duration, has_speakers)."""
+def transcribe_file(
+    file_path: Path,
+    model,
+    model_name: str,
+    language: str | None,
+    vocabulary: str | None,
+    diarize: bool = False,
+    frontmatter: bool = False,
+    speaker_map: dict[str, str] | None = None,
+    interactive_speakers: bool = False,
+) -> tuple[str, list, float, bool]:
+    """Transcribe a single file and return (markdown, segments, duration, has_speakers).
+
+    Args:
+        file_path: Path to media file
+        model: Whisper model instance
+        model_name: Name of the model for metadata
+        language: Language code or None for auto-detect
+        vocabulary: Initial prompt vocabulary
+        diarize: Enable speaker diarization
+        frontmatter: Include YAML frontmatter
+        speaker_map: Pre-defined speaker name mapping
+        interactive_speakers: Prompt for speaker names
+
+    Returns:
+        Tuple of (markdown_content, segments, duration, has_speakers)
+    """
     options = {
         "beam_size": 5,
         "vad_filter": True,  # Skip silent sections
@@ -1169,6 +2086,7 @@ def transcribe_file(file_path: Path, model, model_name: str, language: str | Non
 
     segments, info = model.transcribe(str(file_path), **options)
     duration = info.duration if info.duration else 0
+    detected_language = getattr(info, 'language', language or 'auto')
 
     # Collect segments with progress bar
     segment_list = []
@@ -1197,10 +2115,47 @@ def transcribe_file(file_path: Path, model, model_name: str, language: str | Non
         console.print("  [cyan]Running speaker diarization...[/cyan]")
         diarization_segments = run_diarization(file_path)
         labeled_segments = assign_speakers_to_segments(segment_list, diarization_segments)
-        markdown = generate_markdown(file_path.name, labeled_segments, duration, model_name, has_speakers=True)
+
+        # Handle speaker naming
+        final_speaker_map = speaker_map or {}
+
+        # Load speaker map from folder if not provided
+        if not final_speaker_map:
+            final_speaker_map = load_speaker_map(file_path.parent)
+
+        # Interactive speaker naming
+        if interactive_speakers and not final_speaker_map:
+            speaker_ids = set(seg.get("speaker", "Unknown") for seg in labeled_segments)
+            final_speaker_map = prompt_for_speaker_names(speaker_ids)
+            # Save for future use
+            if final_speaker_map:
+                save_speaker_map(file_path.parent, final_speaker_map)
+
+        # Apply speaker names
+        if final_speaker_map:
+            labeled_segments = apply_speaker_names(labeled_segments, final_speaker_map)
+
+        markdown = generate_markdown(
+            file_path.name,
+            labeled_segments,
+            duration,
+            model_name,
+            has_speakers=True,
+            frontmatter=frontmatter,
+            source_path=file_path,
+            language=detected_language,
+        )
         return markdown, labeled_segments, duration, True
 
-    markdown = generate_markdown(file_path.name, segment_list, duration, model_name)
+    markdown = generate_markdown(
+        file_path.name,
+        segment_list,
+        duration,
+        model_name,
+        frontmatter=frontmatter,
+        source_path=file_path,
+        language=detected_language,
+    )
     return markdown, segment_list, duration, False
 
 
@@ -1333,6 +2288,23 @@ Examples:
   Summary LLM setup (one of these):
     - Ollama (free, local): brew install ollama && ollama pull llama3.2
     - OpenAI: export OPENAI_API_KEY='your_api_key_here'
+
+  Config file support:
+    python transcriber.py /path --model large-v3 --backend mlx --save-config
+    python transcriber.py /path  # uses saved config
+    python transcriber.py /path --config ~/my-config.yaml
+
+  YAML frontmatter (Obsidian/Logseq):
+    python transcriber.py /path --frontmatter  # adds YAML metadata to transcripts
+
+  Speaker naming:
+    python transcriber.py /path --diarize --speakers "0=Colin,1=Matt"
+    python transcriber.py /path --diarize --interactive-speakers
+
+  Semantic search:
+    python transcriber.py /path --index                    # build search index
+    python transcriber.py /path --semantic-search "pinball design philosophy"
+    python transcriber.py /path --semantic-search "Pat Lawlor" --search-limit 10
         """
     )
     parser.add_argument(
@@ -1356,6 +2328,12 @@ Examples:
         default="large-v3",
         choices=["tiny", "base", "small", "medium", "large-v2", "large-v3", "distil-large-v3"],
         help="Whisper model size (default: large-v3)"
+    )
+    parser.add_argument(
+        "--backend",
+        default="faster-whisper",
+        choices=["faster-whisper", "mlx"],
+        help="Transcription backend: faster-whisper (default) or mlx (GPU-accelerated on Apple Silicon)"
     )
     parser.add_argument(
         "--language",
@@ -1469,7 +2447,72 @@ Examples:
         help="Only extract topics from existing transcripts (no transcription)"
     )
 
+    # Config file support
+    parser.add_argument(
+        "--config",
+        type=Path,
+        metavar="FILE",
+        help="Path to config file (default: ~/.config/transcriber/config.yaml)"
+    )
+    parser.add_argument(
+        "--save-config",
+        action="store_true",
+        help="Save current CLI flags as default config"
+    )
+
+    # Frontmatter support
+    parser.add_argument(
+        "--frontmatter",
+        action="store_true",
+        help="Add YAML frontmatter to transcripts for Obsidian/Logseq integration"
+    )
+
+    # Speaker naming support
+    parser.add_argument(
+        "--speakers",
+        metavar="MAP",
+        help="Speaker name mapping (e.g., '0=Host,1=Guest' or '1=Colin,2=Matt')"
+    )
+    parser.add_argument(
+        "--interactive-speakers",
+        action="store_true",
+        help="Prompt for speaker names after diarization"
+    )
+
+    # Semantic search support
+    parser.add_argument(
+        "--index",
+        action="store_true",
+        help="Build/update semantic search index for transcripts"
+    )
+    parser.add_argument(
+        "--semantic-search",
+        metavar="QUERY",
+        help="Search transcripts by meaning (semantic search)"
+    )
+    parser.add_argument(
+        "--search-limit",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Maximum number of semantic search results (default: 5)"
+    )
+
     args = parser.parse_args()
+
+    # Initialize frontmatter attribute if not set
+    if not hasattr(args, 'frontmatter'):
+        args.frontmatter = False
+
+    # Load and apply config file
+    config = load_config(args.config)
+    args = apply_config_to_args(config, args)
+
+    # Save config if requested
+    if args.save_config:
+        config_path = save_config(args, args.config)
+        console.print(f"[green]✓[/green] Config saved to: {config_path}")
+        return
 
     # Validate all folders
     folders = []
@@ -1482,6 +2525,20 @@ Examples:
             print(f"Error: Not a directory: {folder}")
             sys.exit(1)
         folders.append(folder)
+
+    # Semantic search mode
+    if args.semantic_search:
+        results = semantic_search(args.semantic_search, limit=args.search_limit)
+        display_search_results(results, args.semantic_search)
+        return
+
+    # Index mode - build search index
+    if args.index:
+        console.print("Building semantic search index...")
+        indexed = index_transcripts(folders)
+        console.print(f"[green]✓[/green] Indexed {indexed} transcript(s)")
+        console.print(f"  Database: {SEARCH_DB_PATH}")
+        return
 
     # Search mode - search across all provided folders
     if args.search:
@@ -1801,9 +2858,6 @@ Examples:
         console.print("Then: [cyan]export HF_TOKEN='your_token_here'[/cyan]")
         sys.exit(1)
 
-    # Transcribe mode - import faster_whisper only when needed
-    from faster_whisper import WhisperModel
-
     # Collect all media files from all folders
     all_media_files = []
     for folder in folders:
@@ -1817,10 +2871,7 @@ Examples:
 
     console.print(f"Found [bold]{len(all_media_files)}[/bold] media file(s) in [bold]{len(folders)}[/bold] folder(s)")
     console.print(f"Model: [cyan]whisper-{args.model}[/cyan]")
-
-    # Detect device
-    device, compute_type = get_device_and_compute()
-    console.print(f"Device: [cyan]{device}[/cyan] ({compute_type})")
+    console.print(f"Backend: [cyan]{args.backend}[/cyan]")
 
     # Determine vocabulary to use
     if args.no_vocab:
@@ -1837,10 +2888,21 @@ Examples:
         console.print("Diarization: [green]speaker identification enabled[/green]")
     console.print()
 
-    # Load model once
-    with console.status("[bold cyan]Loading Whisper model...", spinner="dots"):
-        model = WhisperModel(args.model, device=device, compute_type=compute_type)
-    console.print("[green]✓[/green] Whisper model loaded")
+    # Load model based on backend
+    if args.backend == "mlx":
+        # MLX backend - GPU-accelerated on Apple Silicon
+        console.print("Device: [cyan]Apple Silicon GPU (Metal)[/cyan]")
+        with console.status("[bold cyan]Loading MLX Whisper model...", spinner="dots"):
+            model = MlxWhisperModel(args.model)
+        console.print("[green]✓[/green] MLX Whisper model loaded")
+    else:
+        # faster-whisper backend (default)
+        from faster_whisper import WhisperModel
+        device, compute_type = get_device_and_compute()
+        console.print(f"Device: [cyan]{device}[/cyan] ({compute_type})")
+        with console.status("[bold cyan]Loading Whisper model...", spinner="dots"):
+            model = WhisperModel(args.model, device=device, compute_type=compute_type)
+        console.print("[green]✓[/green] Whisper model loaded")
 
     # Load diarization model if needed
     if args.diarize:
@@ -1856,6 +2918,9 @@ Examples:
     language = None if args.language == "auto" else args.language
     show_folder = len(folders) > 1
     total_files = len(all_media_files)
+
+    # Parse speaker mapping from CLI if provided
+    speaker_map = parse_speakers_arg(args.speakers) if args.speakers else None
 
     # Process files
     processed = 0
@@ -1884,6 +2949,9 @@ Examples:
                 file_index=i,
                 total_files=total_files,
                 show_folder=show_folder,
+                frontmatter_flag=args.frontmatter,
+                speaker_map=speaker_map,
+                interactive_speakers=args.interactive_speakers,
             )
             if result["status"] == "processed":
                 processed += 1
@@ -1919,6 +2987,9 @@ Examples:
                     file_index=i,
                     total_files=total_files,
                     show_folder=show_folder,
+                    frontmatter_flag=args.frontmatter,
+                    speaker_map=speaker_map,
+                    interactive_speakers=args.interactive_speakers,
                 )
                 futures[future] = media_file
 
